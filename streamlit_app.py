@@ -1,5 +1,10 @@
 # streamlit_app.py
-# Bright Data MCP → Streamlit, now with Batch, Pipeline, and Parallel (threaded) multi-engine runs.
+# Bright Data MCP → Streamlit
+# - Single mode: run multiple engines (sequential or parallel)
+# - Batch mode: run multiple prompts (one per line) across engines
+# - Pipeline mode: chain engines OR repeat the same engine N times; each step receives previous answer_text via {prev}
+# - Export formats: JSON, CSV, Markdown
+# - Dataset IDs optional via Streamlit secrets; per-engine overrides supported
 
 import os
 import io
@@ -189,6 +194,7 @@ def run_ai_search(api_key: str,
     if return_snapshot_link or not snap_id:
         return {"trigger_response": payload, "snapshot_id": snap_id}
 
+    # Wait & download
     poll_progress(api_key, snap_id)
     rows = download_snapshot(api_key, snap_id)
     return {"snapshot_id": snap_id, "rows": rows}
@@ -235,9 +241,8 @@ def build_export_bytes(data_by_engine: dict, fields_by_engine: dict, export_type
         for fields in fields_by_engine.values():
             all_fields.update(fields)
         all_fields.update(["run_label","chain_step"])
-        import csv as _csv
         buf = io.StringIO()
-        writer = _csv.DictWriter(buf, fieldnames=list(all_fields), extrasaction="ignore")
+        writer = csv.DictWriter(buf, fieldnames=list(all_fields), extrasaction="ignore")
         writer.writeheader()
         for eng, rows in data_by_engine.items():
             for r in rows:
@@ -274,8 +279,20 @@ with st.sidebar:
     default_urls = get_default_urls()
 
     run_mode = st.radio("Run mode", ["Single", "Batch (multi-prompts)", "Pipeline (chain engines)"], index=0)
+
     engines_default = ["chatgpt"] if run_mode != "Pipeline (chain engines)" else ["chatgpt","perplexity"]
     engines = st.multiselect("Engines", ALL_ENGINES, default=engines_default)
+
+    # Pipeline-specific: allow repeating a single engine N times
+    pipeline_style = "Ordered engines"
+    single_engine = None
+    repeat_count = 1
+    if run_mode == "Pipeline (chain engines)":
+        pipeline_style = st.radio("Pipeline style", ["Ordered engines", "Repeat single engine"], index=0, horizontal=False)
+        if pipeline_style == "Repeat single engine":
+            single_engine = st.selectbox("Engine to repeat", ALL_ENGINES, index=0)
+            repeat_count = st.slider("Repeat count", 2, 10, 3)
+            st.caption("Note: The multi-engine selection above will be ignored in this mode.")
 
     # NEW: execution strategy for Single mode
     exec_strategy = "Sequential"
@@ -301,7 +318,7 @@ with st.sidebar:
         prompt = ""  # not used
     else:
         start_prompt = st.text_area("Pipeline: starting prompt", height=120, placeholder="Initial question…")
-        chain_template = st.text_area("Template for subsequent engines (use {prev} to insert previous answer_text)", height=140,
+        chain_template = st.text_area("Template for subsequent steps (use {prev} to insert previous answer_text)", height=140,
                                       value="Using the following context, refine or add citations:\n\n{prev}\n\nTask: Provide a concise, cited answer.")
         max_prev_chars = st.slider("Max chars from previous answer to insert", 200, 8000, 2500, step=100)
 
@@ -372,6 +389,12 @@ def engine_job(eng: str, prompt_text: str, url: str, run_label: str, chain_step:
     if not ds:
         return eng, [], effective_fields_for_engine(eng), f"No dataset ID found for {eng}"
     try:
+        extra_dict = None
+        if (extra_json_str or "").strip():
+            try:
+                extra_dict = json.loads(extra_json_str)
+            except Exception:
+                extra_dict = None
         res = run_ai_search(
             api_key=api_key,
             engine=eng,
@@ -383,7 +406,7 @@ def engine_job(eng: str, prompt_text: str, url: str, run_label: str, chain_step:
             web_search=web_search if eng == "chatgpt" else None,
             require_sources=require_sources if eng == "chatgpt" else None,
             additional_prompt=additional_prompt or None,
-            extra=json.loads(extra_json_str) if (extra_json_str.strip() and extra_json_str.strip().startswith("{")) else None,
+            extra=extra_dict,
             include_errors=include_errors,
             return_snapshot_link=return_snapshot_link
         )
@@ -410,24 +433,23 @@ if run:
     if not api_key:
         st.error("Missing BRIGHT_DATA_API_KEY. Add it to Streamlit secrets or environment.")
         st.stop()
-    if not engines:
-        st.error("Pick at least one engine.")
-        st.stop()
 
-    data_by_engine: dict = {eng: [] for eng in engines}
+    data_by_engine: dict = {}
     fields_by_engine: dict = {}
     missing = []
     progress = st.progress(0.0, text="Starting…")
 
     if run_mode == "Single":
-        if not (prompt or "").strip():
+        if not (locals().get("prompt","") or "").strip():
             st.error("Please enter a prompt.")
+            st.stop()
+        if not engines:
+            st.error("Pick at least one engine.")
             st.stop()
 
         url_map = {eng: (entry_url.strip() or get_default_urls().get(eng, "")) for eng in engines}
 
         if exec_strategy == "Parallel (threaded)":
-            # Spawn threads for each engine
             total = len(engines)
             done = 0
             placeholders = {eng: st.empty() for eng in engines}
@@ -447,7 +469,6 @@ if run:
                     done += 1
                     progress.progress(done/max(total,1), text=f"Finished {done}/{total} engines")
         else:
-            # Sequential (existing behavior)
             for idx, eng in enumerate(engines, start=1):
                 progress.progress((idx-1)/max(len(engines),1), text=f"Running {eng}…")
                 url = url_map[eng]
@@ -465,11 +486,14 @@ if run:
         if not lines:
             st.error("Enter at least one prompt line.")
             st.stop()
+        if not engines:
+            st.error("Pick at least one engine.")
+            st.stop()
         parsed = []
         for ln in lines:
             if " | " in ln:
-                p, u = ln.split(" | ", 1)
-                parsed.append((p.strip(), u.strip()))
+                ptext, u = ln.split(" | ", 1)
+                parsed.append((ptext.strip(), u.strip()))
             else:
                 parsed.append((ln, ""))
         total = len(parsed) * max(1, len(engines))
@@ -480,7 +504,7 @@ if run:
                 progress.progress(done/max(total,1), text=f"Running {eng} (batch {i}/{len(parsed)})…")
                 url = (maybe_url or entry_url.strip() or get_default_urls().get(eng, ""))
                 r_eng, rows, fields, err = engine_job(eng, ptext, url, f"batch-{i}", 0)
-                data_by_engine[r_eng].extend(rows)
+                data_by_engine.setdefault(r_eng, []).extend(rows)
                 fields_by_engine[r_eng] = fields
                 if err and "No dataset ID" in err:
                     missing.append(r_eng)
@@ -492,20 +516,35 @@ if run:
             st.stop()
         chain_template = locals().get("chain_template","{prev}")
         max_prev_chars = int(locals().get("max_prev_chars", 2500))
+
+        # Build engine sequence
+        if pipeline_style == "Repeat single engine":
+            if not single_engine or repeat_count < 2:
+                st.error("Pick an engine and a repeat count of at least 2.")
+                st.stop()
+            engine_sequence = [single_engine] * repeat_count
+        else:
+            if not engines:
+                st.error("Pick at least one engine for the pipeline.")
+                st.stop()
+            engine_sequence = list(engines)
+
+        # Execute chain
         prev_text = ""
-        for idx, eng in enumerate(engines, start=1):
-            progress.progress((idx-1)/max(len(engines),1), text=f"Pipeline step {idx}: {eng}…")
+        total = len(engine_sequence)
+        for idx, eng in enumerate(engine_sequence, start=1):
+            progress.progress((idx-1)/max(total,1), text=f"Pipeline step {idx}: {eng}…")
             url = (entry_url.strip() or get_default_urls().get(eng, ""))
             prompt_text = start_prompt if idx == 1 else chain_template.replace("{prev}", (prev_text or "")[:max_prev_chars])
             r_eng, rows, fields, err = engine_job(eng, prompt_text, url, "pipeline", idx)
-            data_by_engine[r_eng].extend(rows)
+            data_by_engine.setdefault(r_eng, []).extend(rows)
             fields_by_engine[r_eng] = fields
             if rows:
                 prev_candidate = rows[0].get("answer_text") or rows[0].get("answer_text_markdown") or ""
                 prev_text = str(prev_candidate)
             if err and "No dataset ID" in err:
                 missing.append(r_eng)
-            progress.progress(idx/max(len(engines),1), text=f"Finished {eng}")
+            progress.progress(idx/max(total,1), text=f"Finished {eng}")
 
     if missing:
         st.warning("No dataset ID found in secrets for: " + ", ".join(sorted(set(missing))) + ". "
@@ -531,4 +570,4 @@ with st.expander("Environment status (read-only)"):
         "default_urls": get_default_urls(),
     })
 
-st.caption("Parallel mode runs multiple engines at once with the same prompt using a thread pool. Adjust 'Max parallel workers' as needed.")
+st.caption("Run single or multiple engines, batches of prompts, or chained pipelines. Pipeline can repeat a single engine N times.")
