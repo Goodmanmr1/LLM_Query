@@ -1,8 +1,5 @@
 # streamlit_app.py
-# Streamlit port of your Bright Data MCP server (ai-search-mcp.js) to a multi-engine UI.
-# - Supports selecting multiple engines at once
-# - Dataset IDs are resolved from Streamlit secrets / env; per-engine override is optional
-# - Export formats: JSON, CSV, Markdown
+# Bright Data MCP → Streamlit, now with Batch & Pipeline (chaining) modes.
 
 import os
 import io
@@ -16,14 +13,12 @@ import streamlit as st
 # ------------------------------ Config helpers ------------------------------
 
 def get_secret(name: str, default: T.Optional[str] = None) -> T.Optional[str]:
-    # Prefer Streamlit secrets, fall back to env
     try:
         return st.secrets.get(name, None) or os.getenv(name, default)
     except Exception:
         return os.getenv(name, default)
 
 BRIGHT_API = "https://api.brightdata.com"
-
 ALL_ENGINES = ["chatgpt", "perplexity", "gemini", "google_ai", "copilot", "grok"]
 
 def get_datasets_map() -> dict:
@@ -193,7 +188,6 @@ def run_ai_search(api_key: str,
     if return_snapshot_link or not snap_id:
         return {"trigger_response": payload, "snapshot_id": snap_id}
 
-    # Wait & download
     poll_progress(api_key, snap_id)
     rows = download_snapshot(api_key, snap_id)
     return {"snapshot_id": snap_id, "rows": rows}
@@ -201,7 +195,6 @@ def run_ai_search(api_key: str,
 # ------------------------------ Flatteners & Export ------------------------------
 
 def flatten_for_csv(record: dict) -> dict:
-    """Return a shallow, CSV-friendly row: strings stay; lists/dicts become compact JSON strings."""
     row = {}
     for k, v in record.items():
         if isinstance(v, (str, int, float)) or v is None:
@@ -216,7 +209,6 @@ def flatten_for_csv(record: dict) -> dict:
 def to_markdown_table(rows: T.List[dict], fields: T.List[str]) -> str:
     if not rows:
         return "_No data_"
-    # Header
     md = io.StringIO()
     md.write("| " + " | ".join(fields) + " |\n")
     md.write("|" + "|".join(["---"]*len(fields)) + "|\n")
@@ -227,36 +219,24 @@ def to_markdown_table(rows: T.List[dict], fields: T.List[str]) -> str:
             if isinstance(v, (dict, list)):
                 v = "```json\n" + json.dumps(v, ensure_ascii=False, indent=2) + "\n```"
             else:
-                # Normalize newlines and pipes to avoid breaking table
                 v = str(v).replace("\n", " ").replace("|", "\\|")
             vals.append(v)
         md.write("| " + " | ".join(vals) + " |\n")
     return md.getvalue()
 
 def build_export_bytes(data_by_engine: dict, fields_by_engine: dict, export_type: str) -> bytes:
-    """
-    data_by_engine: {engine: [sanitized rows]}
-    fields_by_engine: {engine: [fields]}
-    export_type: json | csv | markdown
-    """
     export_type = export_type.lower()
     if export_type == "json":
-        payload = {
-            "engines": list(data_by_engine.keys()),
-            "data": data_by_engine,
-            "fields": fields_by_engine,
-        }
+        payload = {"engines": list(data_by_engine.keys()), "data": data_by_engine, "fields": fields_by_engine}
         return json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-
     elif export_type == "csv":
-        # Union fields across engines, keep engine column
         all_fields = set(["engine"])
-        for eng, fields in fields_by_engine.items():
+        for fields in fields_by_engine.values():
             all_fields.update(fields)
-        all_fields = list(all_fields)
-
+        # also capture run_label / chain_step if present
+        all_fields.update(["run_label","chain_step"])
         buf = io.StringIO()
-        writer = csv.DictWriter(buf, fieldnames=all_fields, extrasaction="ignore")
+        writer = csv.DictWriter(buf, fieldnames=list(all_fields), extrasaction="ignore")
         writer.writeheader()
         for eng, rows in data_by_engine.items():
             for r in rows:
@@ -264,12 +244,11 @@ def build_export_bytes(data_by_engine: dict, fields_by_engine: dict, export_type
                 row["engine"] = eng
                 writer.writerow(row)
         return buf.getvalue().encode("utf-8")
-
     elif export_type == "markdown":
         md = io.StringIO()
         for eng in data_by_engine:
             rows = data_by_engine[eng]
-            fields = fields_by_engine[eng]
+            fields = fields_by_engine[eng] + [f for f in ["run_label","chain_step"] if any(f in r for r in rows)]
             md.write(f"## {eng}\n\n")
             if not rows:
                 md.write("_No data_\n\n")
@@ -277,7 +256,6 @@ def build_export_bytes(data_by_engine: dict, fields_by_engine: dict, export_type
             md.write(to_markdown_table(rows, fields))
             md.write("\n\n")
         return md.getvalue().encode("utf-8")
-
     else:
         raise ValueError(f"Unsupported export type: {export_type}")
 
@@ -294,10 +272,10 @@ with st.sidebar:
     datasets_map = get_datasets_map()
     default_urls = get_default_urls()
 
-    # Multi-engine selection
-    engines = st.multiselect("Engines", ALL_ENGINES, default=["chatgpt"])
+    run_mode = st.radio("Run mode", ["Single", "Batch (multi-prompts)", "Pipeline (chain engines)"], index=0)
+    engines_default = ["chatgpt"] if run_mode != "Pipeline (chain engines)" else ["chatgpt","perplexity"]
+    engines = st.multiselect("Engines", ALL_ENGINES, default=engines_default)
 
-    # Optional: per-engine dataset overrides (only if needed)
     with st.expander("Advanced: per-engine dataset overrides (optional)"):
         overrides = {}
         for eng in ALL_ENGINES:
@@ -307,7 +285,17 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Request")
-    prompt = st.text_area("Prompt", placeholder="Ask the engine(s) something…", height=140)
+
+    if run_mode == "Single":
+        prompt = st.text_area("Prompt", placeholder="Ask the engine(s) something…", height=140)
+    elif run_mode == "Batch (multi-prompts)":
+        prompts_multiline = st.text_area("Prompts (one per line). Optional per-line URL using ' | ' separator: prompt | https://url", height=160)
+        prompt = ""  # not used
+    else:
+        start_prompt = st.text_area("Pipeline: starting prompt", height=120, placeholder="Initial question…")
+        chain_template = st.text_area("Template for subsequent engines (use {prev} to insert previous answer_text)", height=140,
+                                      value="Using the following context, refine or add citations:\n\n{prev}\n\nTask: Provide a concise, cited answer.")
+        max_prev_chars = st.slider("Max chars from previous answer to insert", 200, 8000, 2500, step=100)
 
     col1, col2 = st.columns(2)
     with col1:
@@ -336,7 +324,6 @@ with st.sidebar:
 
     export_type = st.radio("Export type", ["JSON","CSV","Markdown"], index=0, horizontal=True)
 
-    # Custom fields
     custom_fields = {}
     if preset == "Custom":
         st.write("Select fields to keep per engine:")
@@ -346,6 +333,32 @@ with st.sidebar:
 
 run = st.button("Run")
 
+def resolve_dataset(eng: str, overrides: dict, datasets_map: dict) -> T.Optional[str]:
+    if eng in overrides and overrides[eng]:
+        return overrides[eng]
+    return datasets_map.get(eng)
+
+def effective_fields_for_engine(eng: str) -> T.List[str]:
+    if preset == "Custom" and custom_fields.get(eng):
+        eff = list(custom_fields[eng])
+    elif preset == "Compact":
+        eff = COMPACT_FIELDS.get(eng, MINIMAL_FIELDS)
+    else:
+        eff = ENGINE_FIELDS.get(eng, MINIMAL_FIELDS)[:]
+    if exclude_html:
+        eff = [f for f in eff if ("html" not in f and "_html" not in f)]
+    if exclude_raw:
+        eff = [f for f in eff if f != "response_raw"]
+    if include_errors:
+        for f in ["error","error_code","warning","warning_code","input"]:
+            if f not in eff:
+                eff.append(f)
+    # Always include run metadata if present
+    for meta in ["run_label","chain_step"]:
+        if meta not in eff:
+            eff.append(meta)
+    return eff
+
 if run:
     if not api_key:
         st.error("Missing BRIGHT_DATA_API_KEY. Add it to Streamlit secrets or environment.")
@@ -353,11 +366,7 @@ if run:
     if not engines:
         st.error("Pick at least one engine.")
         st.stop()
-    if not prompt.strip():
-        st.error("Please enter a prompt.")
-        st.stop()
 
-    # Resolve 'extra' JSON safely
     extra = None
     if extra_json_str.strip():
         try:
@@ -365,33 +374,24 @@ if run:
         except Exception as e:
             st.warning(f"Ignoring Extra JSON: {e}")
 
-    data_by_engine: dict = {}
+    data_by_engine: dict = {eng: [] for eng in engines}
     fields_by_engine: dict = {}
     missing = []
 
-    progress = st.progress(0.0, text="Starting…")
-    for idx, eng in enumerate(engines, start=1):
-        progress.progress((idx-1)/max(len(engines),1), text=f"Preparing {eng}…")
-
-        # Resolve dataset id: override > secrets; if still missing, record error
-        ds = overrides.get(eng) if 'overrides' in locals() and eng in overrides else datasets_map.get(eng)
+    def run_once(eng: str, url: str, prompt_text: str, run_label: str, chain_step: int = 0):
+        ds = resolve_dataset(eng, overrides, datasets_map)
         if not ds:
             missing.append(eng)
-            data_by_engine[eng] = []
-            fields_by_engine[eng] = []
-            continue
+            fields_by_engine.setdefault(eng, effective_fields_for_engine(eng))
+            return
 
-        # Resolve URL for this engine: explicit entry_url > engine default
-        url = entry_url.strip() or get_default_urls().get(eng, "")
-
-        st.info(f"Triggering Bright Data dataset for **{eng}**…")
         try:
             res = run_ai_search(
                 api_key=api_key,
                 engine=eng,
                 dataset_id=ds,
                 url=url,
-                prompt=prompt,
+                prompt=prompt_text,
                 index=int(index),
                 country=country or None,
                 web_search=web_search if eng == "chatgpt" else None,
@@ -401,51 +401,89 @@ if run:
                 include_errors=include_errors,
                 return_snapshot_link=return_snapshot_link
             )
-
             if return_snapshot_link or "rows" not in res:
-                # Snapshot-only mode; store trigger details
-                fields_by_engine[eng] = ["snapshot_id","trigger_response"]
-                data_by_engine[eng] = [ { "snapshot_id": res.get("snapshot_id"), "trigger_response": res.get("trigger_response") } ]
+                row = {"snapshot_id": res.get("snapshot_id"), "trigger_response": res.get("trigger_response"),
+                       "run_label": run_label, "chain_step": chain_step}
+                data_by_engine[eng].append(row)
+                fields_by_engine.setdefault(eng, ["snapshot_id","trigger_response","run_label","chain_step"])
+                return None
             else:
                 rows = res.get("rows", [])
-
-                # Determine fields to keep for this engine
-                if preset == "Custom" and custom_fields.get(eng):
-                    effective_fields = list(custom_fields[eng])
-                elif preset == "Compact":
-                    effective_fields = COMPACT_FIELDS.get(eng, MINIMAL_FIELDS)
-                else:
-                    effective_fields = ENGINE_FIELDS.get(eng, MINIMAL_FIELDS)[:]
-
-                if exclude_html:
-                    effective_fields = [f for f in effective_fields if ("html" not in f and "_html" not in f)]
-                if exclude_raw:
-                    effective_fields = [f for f in effective_fields if f != "response_raw"]
-                if include_errors:
-                    for f in ["error","error_code","warning","warning_code","input"]:
-                        if f not in effective_fields:
-                            effective_fields.append(f)
-
+                eff = effective_fields_for_engine(eng)
                 pruned = [
-                    sanitize_object(r, effective_fields, max_chars=max_chars, max_citations=max_citations, max_array_items=max_array_items)
+                    sanitize_object(r, eff, max_chars=max_chars, max_citations=max_citations, max_array_items=max_array_items)
                     for r in rows[:max_items]
                 ]
-
-                data_by_engine[eng] = pruned
-                fields_by_engine[eng] = effective_fields
-
-            progress.progress(idx/max(len(engines),1), text=f"Finished {eng}")
-
+                # attach metadata
+                for r in pruned:
+                    r["run_label"] = run_label
+                    r["chain_step"] = chain_step
+                data_by_engine[eng].extend(pruned)
+                fields_by_engine.setdefault(eng, eff)
+                # return a concatenated previous text for chaining convenience
+                if pruned:
+                    # prefer answer_text, fallback to answer_text_markdown, else stringify first row
+                    prev = pruned[0].get("answer_text") or pruned[0].get("answer_text_markdown") or json.dumps(pruned[0])
+                    return str(prev)
+                return None
         except Exception as e:
             st.error(f"{eng} → {type(e).__name__}: {e}")
-            data_by_engine[eng] = []
-            fields_by_engine[eng] = []
+            fields_by_engine.setdefault(eng, effective_fields_for_engine(eng))
+            return None
+
+    progress = st.progress(0.0, text="Starting…")
+
+    if run_mode == "Single":
+        if not st.session_state.get("single_prompt_cache"):
+            st.session_state["single_prompt_cache"] = ""
+        if not prompt.strip():
+            st.error("Please enter a prompt.")
+            st.stop()
+        for idx, eng in enumerate(engines, start=1):
+            progress.progress((idx-1)/max(len(engines),1), text=f"Running {eng}…")
+            url = (entry_url.strip() or get_default_urls().get(eng, ""))
+            run_once(eng, url, prompt, run_label="single", chain_step=0)
+            progress.progress(idx/max(len(engines),1), text=f"Finished {eng}")
+
+    elif run_mode == "Batch (multi-prompts)":
+        lines = [ln.strip() for ln in (prompts_multiline or "").splitlines() if ln.strip()]
+        if not lines:
+            st.error("Enter at least one prompt line.")
+            st.stop()
+        # Format: "prompt | optional_url"
+        parsed = []
+        for ln in lines:
+            if " | " in ln:
+                p, u = ln.split(" | ", 1)
+                parsed.append((p.strip(), u.strip()))
+            else:
+                parsed.append((ln, ""))
+        total = len(parsed) * max(1, len(engines))
+        done = 0
+        for i, (ptext, maybe_url) in enumerate(parsed, start=1):
+            for eng in engines:
+                done += 1
+                progress.progress(done/max(total,1), text=f"Running {eng} (batch {i}/{len(parsed)})…")
+                url = (maybe_url or entry_url.strip() or get_default_urls().get(eng, ""))
+                run_once(eng, url, ptext, run_label=f"batch-{i}", chain_step=0)
+
+    else:  # Pipeline (chain engines)
+        if not start_prompt.strip():
+            st.error("Enter a starting prompt for the pipeline.")
+            st.stop()
+        # We execute engines sequentially; each step sees previous step's text injected into {prev}
+        prev_text = ""
+        for idx, eng in enumerate(engines, start=1):
+            progress.progress((idx-1)/max(len(engines),1), text=f"Pipeline step {idx}: {eng}…")
+            url = (entry_url.strip() or get_default_urls().get(eng, ""))
+            prompt_text = start_prompt if idx == 1 else chain_template.replace("{prev}", (prev_text or "")[:max_prev_chars])
+            prev_text = run_once(eng, url, prompt_text, run_label="pipeline", chain_step=idx) or prev_text
+            progress.progress(idx/max(len(engines),1), text=f"Finished {eng}")
 
     if missing:
-        st.warning("No dataset ID found in secrets for: " + ", ".join(missing) + ". "
+        st.warning("No dataset ID found in secrets for: " + ", ".join(sorted(set(missing))) + ". "
                    "Add them to Streamlit secrets (e.g., BD_DATASET_CHATGPT) or provide overrides in the expander.")
 
-    # Build export
     try:
         blob = build_export_bytes(data_by_engine, fields_by_engine, export_type)
         fname = f"bright_ai_search.{export_type.lower()}"
@@ -455,7 +493,6 @@ if run:
     except Exception as e:
         st.error(f"Export error: {type(e).__name__}: {e}")
 
-    # Show a compact preview
     st.subheader("Preview")
     with st.expander("Data by engine"):
         st.json({"data": data_by_engine, "fields": fields_by_engine}, expanded=False)
@@ -467,4 +504,4 @@ with st.expander("Environment status (read-only)"):
         "default_urls": get_default_urls(),
     })
 
-st.caption("Tip: Add BD_DATASET_* to Streamlit secrets to skip entering dataset IDs. Use the expander for one-off overrides.")
+st.caption("Run multiple engines, batches of prompts, or pipeline across engines with previous answers feeding the next step.")
