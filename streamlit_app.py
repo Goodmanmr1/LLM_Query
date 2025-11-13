@@ -1,5 +1,5 @@
 # streamlit_app.py
-# Bright Data MCP → Streamlit, now with Batch & Pipeline (chaining) modes.
+# Bright Data MCP → Streamlit, now with Batch, Pipeline, and Parallel (threaded) multi-engine runs.
 
 import os
 import io
@@ -9,6 +9,7 @@ import typing as T
 import csv
 import requests
 import streamlit as st
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ------------------------------ Config helpers ------------------------------
 
@@ -233,10 +234,10 @@ def build_export_bytes(data_by_engine: dict, fields_by_engine: dict, export_type
         all_fields = set(["engine"])
         for fields in fields_by_engine.values():
             all_fields.update(fields)
-        # also capture run_label / chain_step if present
         all_fields.update(["run_label","chain_step"])
+        import csv as _csv
         buf = io.StringIO()
-        writer = csv.DictWriter(buf, fieldnames=list(all_fields), extrasaction="ignore")
+        writer = _csv.DictWriter(buf, fieldnames=list(all_fields), extrasaction="ignore")
         writer.writeheader()
         for eng, rows in data_by_engine.items():
             for r in rows:
@@ -275,6 +276,13 @@ with st.sidebar:
     run_mode = st.radio("Run mode", ["Single", "Batch (multi-prompts)", "Pipeline (chain engines)"], index=0)
     engines_default = ["chatgpt"] if run_mode != "Pipeline (chain engines)" else ["chatgpt","perplexity"]
     engines = st.multiselect("Engines", ALL_ENGINES, default=engines_default)
+
+    # NEW: execution strategy for Single mode
+    exec_strategy = "Sequential"
+    max_workers = 4
+    if run_mode == "Single":
+        exec_strategy = st.radio("Engine execution", ["Sequential", "Parallel (threaded)"], index=0, horizontal=True)
+        max_workers = st.slider("Max parallel workers", 1, 8, min(4, max(1, len(engines))), help="Controls how many engines run at once.")
 
     with st.expander("Advanced: per-engine dataset overrides (optional)"):
         overrides = {}
@@ -353,11 +361,50 @@ def effective_fields_for_engine(eng: str) -> T.List[str]:
         for f in ["error","error_code","warning","warning_code","input"]:
             if f not in eff:
                 eff.append(f)
-    # Always include run metadata if present
     for meta in ["run_label","chain_step"]:
         if meta not in eff:
             eff.append(meta)
     return eff
+
+def engine_job(eng: str, prompt_text: str, url: str, run_label: str, chain_step: int = 0):
+    """Run a single engine and return (eng, rows, fields, error_or_none)."""
+    ds = resolve_dataset(eng, overrides, datasets_map)
+    if not ds:
+        return eng, [], effective_fields_for_engine(eng), f"No dataset ID found for {eng}"
+    try:
+        res = run_ai_search(
+            api_key=api_key,
+            engine=eng,
+            dataset_id=ds,
+            url=url,
+            prompt=prompt_text,
+            index=int(index),
+            country=country or None,
+            web_search=web_search if eng == "chatgpt" else None,
+            require_sources=require_sources if eng == "chatgpt" else None,
+            additional_prompt=additional_prompt or None,
+            extra=json.loads(extra_json_str) if (extra_json_str.strip() and extra_json_str.strip().startswith("{")) else None,
+            include_errors=include_errors,
+            return_snapshot_link=return_snapshot_link
+        )
+        if return_snapshot_link or "rows" not in res:
+            row = {"snapshot_id": res.get("snapshot_id"), "trigger_response": res.get("trigger_response"),
+                   "run_label": run_label, "chain_step": chain_step}
+            fields = ["snapshot_id","trigger_response","run_label","chain_step"]
+            return eng, [row], fields, None
+        else:
+            rows = res.get("rows", [])
+            eff = effective_fields_for_engine(eng)
+            pruned = [
+                sanitize_object(r, eff, max_chars=max_chars, max_citations=max_citations, max_array_items=max_array_items)
+                for r in rows[:max_items]
+            ]
+            for r in pruned:
+                r["run_label"] = run_label
+                r["chain_step"] = chain_step
+            return eng, pruned, eff, None
+    except Exception as e:
+        return eng, [], effective_fields_for_engine(eng), f"{type(e).__name__}: {e}"
 
 if run:
     if not api_key:
@@ -367,90 +414,57 @@ if run:
         st.error("Pick at least one engine.")
         st.stop()
 
-    extra = None
-    if extra_json_str.strip():
-        try:
-            extra = json.loads(extra_json_str)
-        except Exception as e:
-            st.warning(f"Ignoring Extra JSON: {e}")
-
     data_by_engine: dict = {eng: [] for eng in engines}
     fields_by_engine: dict = {}
     missing = []
-
-    def run_once(eng: str, url: str, prompt_text: str, run_label: str, chain_step: int = 0):
-        ds = resolve_dataset(eng, overrides, datasets_map)
-        if not ds:
-            missing.append(eng)
-            fields_by_engine.setdefault(eng, effective_fields_for_engine(eng))
-            return
-
-        try:
-            res = run_ai_search(
-                api_key=api_key,
-                engine=eng,
-                dataset_id=ds,
-                url=url,
-                prompt=prompt_text,
-                index=int(index),
-                country=country or None,
-                web_search=web_search if eng == "chatgpt" else None,
-                require_sources=require_sources if eng == "chatgpt" else None,
-                additional_prompt=additional_prompt or None,
-                extra=extra,
-                include_errors=include_errors,
-                return_snapshot_link=return_snapshot_link
-            )
-            if return_snapshot_link or "rows" not in res:
-                row = {"snapshot_id": res.get("snapshot_id"), "trigger_response": res.get("trigger_response"),
-                       "run_label": run_label, "chain_step": chain_step}
-                data_by_engine[eng].append(row)
-                fields_by_engine.setdefault(eng, ["snapshot_id","trigger_response","run_label","chain_step"])
-                return None
-            else:
-                rows = res.get("rows", [])
-                eff = effective_fields_for_engine(eng)
-                pruned = [
-                    sanitize_object(r, eff, max_chars=max_chars, max_citations=max_citations, max_array_items=max_array_items)
-                    for r in rows[:max_items]
-                ]
-                # attach metadata
-                for r in pruned:
-                    r["run_label"] = run_label
-                    r["chain_step"] = chain_step
-                data_by_engine[eng].extend(pruned)
-                fields_by_engine.setdefault(eng, eff)
-                # return a concatenated previous text for chaining convenience
-                if pruned:
-                    # prefer answer_text, fallback to answer_text_markdown, else stringify first row
-                    prev = pruned[0].get("answer_text") or pruned[0].get("answer_text_markdown") or json.dumps(pruned[0])
-                    return str(prev)
-                return None
-        except Exception as e:
-            st.error(f"{eng} → {type(e).__name__}: {e}")
-            fields_by_engine.setdefault(eng, effective_fields_for_engine(eng))
-            return None
-
     progress = st.progress(0.0, text="Starting…")
 
     if run_mode == "Single":
-        if not st.session_state.get("single_prompt_cache"):
-            st.session_state["single_prompt_cache"] = ""
-        if not prompt.strip():
+        if not (prompt or "").strip():
             st.error("Please enter a prompt.")
             st.stop()
-        for idx, eng in enumerate(engines, start=1):
-            progress.progress((idx-1)/max(len(engines),1), text=f"Running {eng}…")
-            url = (entry_url.strip() or get_default_urls().get(eng, ""))
-            run_once(eng, url, prompt, run_label="single", chain_step=0)
-            progress.progress(idx/max(len(engines),1), text=f"Finished {eng}")
+
+        url_map = {eng: (entry_url.strip() or get_default_urls().get(eng, "")) for eng in engines}
+
+        if exec_strategy == "Parallel (threaded)":
+            # Spawn threads for each engine
+            total = len(engines)
+            done = 0
+            placeholders = {eng: st.empty() for eng in engines}
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                futures = {ex.submit(engine_job, eng, prompt, url_map[eng], "single", 0): eng for eng in engines}
+                for fut in as_completed(futures):
+                    eng = futures[fut]
+                    r_eng, rows, fields, err = fut.result()
+                    data_by_engine[r_eng] = rows
+                    fields_by_engine[r_eng] = fields
+                    if err:
+                        placeholders[r_eng].error(f"{r_eng}: {err}")
+                        if "No dataset ID" in err:
+                            missing.append(r_eng)
+                    else:
+                        placeholders[r_eng].success(f"{r_eng}: done ({len(rows)} row(s))")
+                    done += 1
+                    progress.progress(done/max(total,1), text=f"Finished {done}/{total} engines")
+        else:
+            # Sequential (existing behavior)
+            for idx, eng in enumerate(engines, start=1):
+                progress.progress((idx-1)/max(len(engines),1), text=f"Running {eng}…")
+                url = url_map[eng]
+                r_eng, rows, fields, err = engine_job(eng, prompt, url, "single", 0)
+                data_by_engine[r_eng] = rows
+                fields_by_engine[r_eng] = fields
+                if err:
+                    st.error(f"{r_eng}: {err}")
+                    if "No dataset ID" in err:
+                        missing.append(r_eng)
+                progress.progress(idx/max(len(engines),1), text=f"Finished {eng}")
 
     elif run_mode == "Batch (multi-prompts)":
-        lines = [ln.strip() for ln in (prompts_multiline or "").splitlines() if ln.strip()]
+        lines = [ln.strip() for ln in (locals().get("prompts_multiline","") or "").splitlines() if ln.strip()]
         if not lines:
             st.error("Enter at least one prompt line.")
             st.stop()
-        # Format: "prompt | optional_url"
         parsed = []
         for ln in lines:
             if " | " in ln:
@@ -465,19 +479,32 @@ if run:
                 done += 1
                 progress.progress(done/max(total,1), text=f"Running {eng} (batch {i}/{len(parsed)})…")
                 url = (maybe_url or entry_url.strip() or get_default_urls().get(eng, ""))
-                run_once(eng, url, ptext, run_label=f"batch-{i}", chain_step=0)
+                r_eng, rows, fields, err = engine_job(eng, ptext, url, f"batch-{i}", 0)
+                data_by_engine[r_eng].extend(rows)
+                fields_by_engine[r_eng] = fields
+                if err and "No dataset ID" in err:
+                    missing.append(r_eng)
 
-    else:  # Pipeline (chain engines)
+    else:  # Pipeline
+        start_prompt = locals().get("start_prompt","")
         if not start_prompt.strip():
             st.error("Enter a starting prompt for the pipeline.")
             st.stop()
-        # We execute engines sequentially; each step sees previous step's text injected into {prev}
+        chain_template = locals().get("chain_template","{prev}")
+        max_prev_chars = int(locals().get("max_prev_chars", 2500))
         prev_text = ""
         for idx, eng in enumerate(engines, start=1):
             progress.progress((idx-1)/max(len(engines),1), text=f"Pipeline step {idx}: {eng}…")
             url = (entry_url.strip() or get_default_urls().get(eng, ""))
             prompt_text = start_prompt if idx == 1 else chain_template.replace("{prev}", (prev_text or "")[:max_prev_chars])
-            prev_text = run_once(eng, url, prompt_text, run_label="pipeline", chain_step=idx) or prev_text
+            r_eng, rows, fields, err = engine_job(eng, prompt_text, url, "pipeline", idx)
+            data_by_engine[r_eng].extend(rows)
+            fields_by_engine[r_eng] = fields
+            if rows:
+                prev_candidate = rows[0].get("answer_text") or rows[0].get("answer_text_markdown") or ""
+                prev_text = str(prev_candidate)
+            if err and "No dataset ID" in err:
+                missing.append(r_eng)
             progress.progress(idx/max(len(engines),1), text=f"Finished {eng}")
 
     if missing:
@@ -504,4 +531,4 @@ with st.expander("Environment status (read-only)"):
         "default_urls": get_default_urls(),
     })
 
-st.caption("Run multiple engines, batches of prompts, or pipeline across engines with previous answers feeding the next step.")
+st.caption("Parallel mode runs multiple engines at once with the same prompt using a thread pool. Adjust 'Max parallel workers' as needed.")
