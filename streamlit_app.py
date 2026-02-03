@@ -2,6 +2,7 @@
 # Bright Data MCP → Streamlit
 # - Single mode: run multiple engines (sequential or parallel)
 # - Batch mode: run multiple prompts (one per line) across engines
+#   ↳ Supports parallel (threaded) execution for fast bulk processing
 # - Pipeline mode: chain engines OR repeat the same engine N times; each step receives previous answer_text via {prev}
 # - Export formats: JSON, CSV, Markdown
 # - Dataset IDs optional via Streamlit secrets; per-engine overrides supported
@@ -294,12 +295,23 @@ with st.sidebar:
             repeat_count = st.slider("Repeat count", 2, 10, 3)
             st.caption("Note: The multi-engine selection above will be ignored in this mode.")
 
-    # NEW: execution strategy for Single mode
+    # Execution strategy for Single and Batch modes
     exec_strategy = "Sequential"
     max_workers = 4
-    if run_mode == "Single":
-        exec_strategy = st.radio("Engine execution", ["Sequential", "Parallel (threaded)"], index=0, horizontal=True)
-        max_workers = st.slider("Max parallel workers", 1, 8, min(4, max(1, len(engines))), help="Controls how many engines run at once.")
+    if run_mode in ("Single", "Batch (multi-prompts)"):
+        exec_strategy = st.radio("Execution", ["Sequential", "Parallel (threaded)"], index=0, horizontal=True)
+        if run_mode == "Batch (multi-prompts)":
+            default_w = min(6, max(1, len(engines) * 2))
+            max_workers = st.slider(
+                "Max parallel workers", 1, 16, default_w,
+                help="How many (prompt × engine) jobs run concurrently. "
+                     "Higher = faster but uses more API quota."
+            )
+        else:
+            max_workers = st.slider(
+                "Max parallel workers", 1, 8, min(4, max(1, len(engines))),
+                help="Controls how many engines run at once."
+            )
 
     with st.expander("Advanced: per-engine dataset overrides (optional)"):
         overrides = {}
@@ -497,12 +509,46 @@ if run:
             else:
                 parsed.append((ln, ""))
         total = len(parsed) * max(1, len(engines))
-        done = 0
+
+        # Build a flat list of all jobs: (batch_index, prompt_text, engine, url)
+        jobs = []
         for i, (ptext, maybe_url) in enumerate(parsed, start=1):
             for eng in engines:
+                url = (maybe_url or entry_url.strip() or get_default_urls().get(eng, ""))
+                jobs.append((i, ptext, eng, url))
+
+        if exec_strategy == "Parallel (threaded)":
+            done = 0
+            st.info(f"Running {total} jobs with up to {max_workers} parallel workers…")
+            errors = []
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                futures = {
+                    ex.submit(engine_job, eng, ptext, url, f"batch-{i}", 0): (i, eng, ptext)
+                    for i, ptext, eng, url in jobs
+                }
+                for fut in as_completed(futures):
+                    i, eng, ptext = futures[fut]
+                    r_eng, rows, fields, err = fut.result()
+                    data_by_engine.setdefault(r_eng, []).extend(rows)
+                    fields_by_engine[r_eng] = fields
+                    if err:
+                        errors.append(f"batch-{i} / {r_eng}: {err}")
+                        if "No dataset ID" in err:
+                            missing.append(r_eng)
+                    done += 1
+                    progress.progress(
+                        done / max(total, 1),
+                        text=f"Completed {done}/{total} jobs"
+                    )
+            if errors:
+                with st.expander(f"⚠️ {len(errors)} job(s) had errors"):
+                    for e in errors:
+                        st.warning(e)
+        else:
+            done = 0
+            for i, ptext, eng, url in jobs:
                 done += 1
                 progress.progress(done/max(total,1), text=f"Running {eng} (batch {i}/{len(parsed)})…")
-                url = (maybe_url or entry_url.strip() or get_default_urls().get(eng, ""))
                 r_eng, rows, fields, err = engine_job(eng, ptext, url, f"batch-{i}", 0)
                 data_by_engine.setdefault(r_eng, []).extend(rows)
                 fields_by_engine[r_eng] = fields
